@@ -7,18 +7,29 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Database path configuration for hosting (e.g., Render.com Disks)
-const DB_PATH = process.env.NODE_ENV === "production" 
-  ? (process.env.DATABASE_PATH || "/var/data/orders.db")
-  : "orders.db";
+// Database path configuration for hosting
+let DB_PATH = "orders.db";
 
-// Ensure the directory for the database exists
-const dbDir = path.dirname(DB_PATH);
-if (dbDir !== "." && !fs.existsSync(dbDir)) {
-  try {
-    fs.mkdirSync(dbDir, { recursive: true });
-  } catch (err) {
-    console.error("Failed to create database directory:", err);
+if (process.env.NODE_ENV === "production") {
+  if (process.env.DATABASE_PATH) {
+    DB_PATH = process.env.DATABASE_PATH;
+  } else {
+    // Try to use /var/data if it exists (Render Disk), otherwise fallback to local
+    const preferredPath = "/var/data/orders.db";
+    const preferredDir = path.dirname(preferredPath);
+    
+    if (fs.existsSync(preferredDir)) {
+      DB_PATH = preferredPath;
+    } else {
+      try {
+        // Try to create it, if it fails, we stay with "orders.db"
+        fs.mkdirSync(preferredDir, { recursive: true });
+        DB_PATH = preferredPath;
+      } catch (err) {
+        console.warn("Could not use /var/data, falling back to local storage. Orders will not persist across restarts on Free tier.");
+        DB_PATH = "orders.db";
+      }
+    }
   }
 }
 
