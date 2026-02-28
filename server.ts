@@ -1,61 +1,62 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
+import pg from "pg";
 import path from "path";
-import fs from "fs";
 import { fileURLToPath } from "url";
 
+const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Database path configuration for hosting
-let DB_PATH = "orders.db";
-
-if (process.env.NODE_ENV === "production") {
-  if (process.env.DATABASE_PATH) {
-    DB_PATH = process.env.DATABASE_PATH;
-  } else {
-    // Try to use /var/data if it exists (Render Disk), otherwise fallback to local
-    const preferredPath = "/var/data/orders.db";
-    const preferredDir = path.dirname(preferredPath);
-    
-    if (fs.existsSync(preferredDir)) {
-      DB_PATH = preferredPath;
-    } else {
-      try {
-        // Try to create it, if it fails, we stay with "orders.db"
-        fs.mkdirSync(preferredDir, { recursive: true });
-        DB_PATH = preferredPath;
-      } catch (err) {
-        console.warn("Could not use /var/data, falling back to local storage. Orders will not persist across restarts on Free tier.");
-        DB_PATH = "orders.db";
-      }
-    }
+// Connect to Supabase using the DATABASE_URL from Render Environment Variables
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
   }
-}
+});
 
-const db = new Database(DB_PATH);
+// Initialize Database Tables in Supabase
+const initDb = async () => {
+  const client = await pool.connect();
+  try {
+    // Create Orders Table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        service_type TEXT,
+        quantity INTEGER,
+        price INTEGER,
+        reel_url TEXT,
+        utr_number TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
-// Initialize database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS orders (
-    id TEXT PRIMARY KEY,
-    service_type TEXT,
-    package_id TEXT,
-    quantity INTEGER,
-    price INTEGER,
-    reel_url TEXT,
-    utr_number TEXT,
-    status TEXT DEFAULT 'pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    // Create Settings Table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+    `);
 
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
+    // Set default server status to 'open'
+    await client.query(`
+      INSERT INTO settings (key, value) 
+      VALUES ('server_status', 'open') 
+      ON CONFLICT (key) DO NOTHING;
+    `);
 
-  INSERT OR IGNORE INTO settings (key, value) VALUES ('server_status', 'open');
-`);
+    console.log("Supabase Database Initialized Successfully!");
+  } catch (err) {
+    console.error("Database Initialization Error:", err);
+  } finally {
+    client.release();
+  }
+};
+
+initDb();
 
 async function startServer() {
   const app = express();
@@ -65,111 +66,110 @@ async function startServer() {
 
   // Health Check
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", environment: process.env.NODE_ENV || 'development' });
+    res.json({ status: "ok" });
   });
 
-  // API Routes
-  app.get("/api/settings/server-status", (req, res) => {
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'server_status'").get();
-    res.json({ status: row ? row.value : 'open' });
-  });
-
-  app.patch("/api/settings/server-status", (req, res) => {
-    const adminCode = req.headers["x-admin-code"];
-    console.log(`[Admin] Server status change request. Admin code provided: ${adminCode ? 'Yes' : 'No'}`);
-    if (adminCode !== "2563123456789") {
-      console.error("[Admin] Unauthorized server status change attempt");
-      return res.status(403).json({ error: "Unauthorized" });
-    }
-    const { status } = req.body;
-    console.log(`[Admin] Updating server status to: ${status}`);
-    db.prepare("UPDATE settings SET value = ? WHERE key = 'server_status'").run(status);
-    res.json({ success: true });
-  });
-
-  app.post("/api/orders", (req, res) => {
-    const { id, service_type, package_id, quantity, price, reel_url, utr_number } = req.body;
-    console.log(`[Order] New order request: ${id}, UTR: ${utr_number}`);
+  // Get Server Status
+  app.get("/api/settings/server-status", async (req, res) => {
     try {
-      const stmt = db.prepare(`
-        INSERT INTO orders (id, service_type, package_id, quantity, price, reel_url, utr_number)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      stmt.run(id, service_type, package_id, quantity, price, reel_url, utr_number);
+      const result = await pool.query("SELECT value FROM settings WHERE key = 'server_status'");
+      res.json({ status: result.rows[0]?.value || 'open' });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to fetch status" });
+    }
+  });
+
+  // Update Server Status (Admin Only)
+  app.patch("/api/settings/server-status", async (req, res) => {
+    const adminCode = req.headers["x-admin-code"];
+    if (adminCode !== "2563123456789") return res.status(403).json({ error: "Unauthorized" });
+    
+    const { status } = req.body;
+    try {
+      await pool.query("UPDATE settings SET value = $1 WHERE key = 'server_status'", [status]);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to update status" });
+    }
+  });
+
+  // Create New Order
+  app.post("/api/orders", async (req, res) => {
+    const { id, service_type, quantity, price, reel_url, utr_number } = req.body;
+    try {
+      await pool.query(
+        "INSERT INTO orders (id, service_type, quantity, price, reel_url, utr_number) VALUES ($1, $2, $3, $4, $5, $6)",
+        [id, service_type, quantity, price, reel_url, utr_number]
+      );
       
-      // Send Telegram Notification (Optional)
+      // Telegram Notification
       const botToken = process.env.TELEGRAM_BOT_TOKEN;
       const chatId = process.env.TELEGRAM_CHAT_ID;
       if (botToken && chatId) {
-        const message = `
-🚀 *New Order Received!*
-------------------------
-🆔 *ID:* ${id}
-🛠 *Service:* ${service_type}
-📦 *Package:* ${quantity.toLocaleString()}
-💰 *Price:* ₹${price}
-🔗 *Link:* ${reel_url}
-💳 *UTR:* ${utr_number}
-
-Check admin panel to approve!
-        `;
-        
+        const message = `🚀 *New Order Received!*\n\nID: ${id}\nService: ${service_type}\nQty: ${quantity}\nPrice: ₹${price}\nUTR: ${utr_number}\nLink: ${reel_url}`;
         fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: message,
-            parse_mode: 'Markdown'
-          })
-        }).catch(err => console.error("Telegram notification failed", err));
+          body: JSON.stringify({ chat_id: chatId, text: message })
+        }).catch(e => console.error("Telegram error:", e));
       }
 
       res.status(201).json({ success: true });
     } catch (error) {
-      console.error(error);
+      console.error("Order Error:", error);
       res.status(500).json({ error: "Failed to create order" });
     }
   });
 
-  app.get("/api/orders", (req, res) => {
+  // Get All Orders (Admin Only)
+  app.get("/api/orders", async (req, res) => {
     const adminCode = req.headers["x-admin-code"];
-    if (adminCode !== "2563123456789") {
-      return res.status(403).json({ error: "Unauthorized" });
-    }
-    const orders = db.prepare("SELECT * FROM orders ORDER BY created_at DESC").all();
-    res.json(orders);
-  });
-
-  app.get("/api/orders/:id", (req, res) => {
-    const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(req.params.id);
-    if (!order) return res.status(404).json({ error: "Order not found" });
-    res.json(order);
-  });
-
-  app.post("/api/orders/batch", (req, res) => {
-    const { ids } = req.body;
-    if (!Array.isArray(ids)) return res.status(400).json({ error: "Invalid IDs" });
+    if (adminCode !== "2563123456789") return res.status(403).json({ error: "Unauthorized" });
     
-    const placeholders = ids.map(() => "?").join(",");
-    const orders = db.prepare(`SELECT * FROM orders WHERE id IN (${placeholders}) ORDER BY created_at DESC`).all(...ids);
-    res.json(orders);
-  });
-
-  app.patch("/api/orders/:id/approve", (req, res) => {
-    const adminCode = req.headers["x-admin-code"];
-    if (adminCode !== "2563123456789") {
-      return res.status(403).json({ error: "Unauthorized" });
-    }
     try {
-      db.prepare("UPDATE orders SET status = 'approved' WHERE id = ?").run(req.params.id);
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to approve order" });
+      const result = await pool.query("SELECT * FROM orders ORDER BY created_at DESC");
+      res.json(result.rows);
+    } catch (err) {
+      res.status(500).json({ error: "Failed to fetch orders" });
     }
   });
 
-  // Vite middleware for development
+  // Get Single Order Status
+  app.get("/api/orders/:id", async (req, res) => {
+    try {
+      const result = await pool.query("SELECT * FROM orders WHERE id = $1", [req.params.id]);
+      if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
+      res.json(result.rows[0]);
+    } catch (err) {
+      res.status(500).json({ error: "Failed" });
+    }
+  });
+
+  // Get Batch Orders (History)
+  app.post("/api/orders/batch", async (req, res) => {
+    const { ids } = req.body;
+    try {
+      const result = await pool.query("SELECT * FROM orders WHERE id = ANY($1) ORDER BY created_at DESC", [ids]);
+      res.json(result.rows);
+    } catch (err) {
+      res.status(500).json({ error: "Failed" });
+    }
+  });
+
+  // Approve Order (Admin Only)
+  app.patch("/api/orders/:id/approve", async (req, res) => {
+    const adminCode = req.headers["x-admin-code"];
+    if (adminCode !== "2563123456789") return res.status(403).json({ error: "Unauthorized" });
+    
+    try {
+      await pool.query("UPDATE orders SET status = 'approved' WHERE id = $1", [req.params.id]);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to approve" });
+    }
+  });
+
+  // Serve Frontend
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
